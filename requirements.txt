@@ -5,6 +5,7 @@ scikit-learn
 joblib
 matplotlib
 imbalanced-learn
+requests
 
 xgboost
 lightgbm
@@ -14,3 +15,4 @@ shap
 # optional (keep only if your Streamlit Cloud build supports them)
 pytorch-tabnet
 tabpfn
+
