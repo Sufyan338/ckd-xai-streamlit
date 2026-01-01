@@ -2,3 +2,11 @@ streamlit
 pandas
 numpy
 scikit-learn
+shap
+xgboost
+lightgbm
+catboost
+imbalanced-learn
+pytorch-tabnet
+tabpfn
+
