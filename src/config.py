@@ -1,3 +1,4 @@
 TARGET_BINARY = "ckd_pred"
 TARGET_STAGE = "ckd_stage"
 RANDOM_STATE = 42
+N_SPLITS = 5
