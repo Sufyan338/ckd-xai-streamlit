@@ -23,9 +23,9 @@ st.title("CKD Smart Diagnostic Framework (ML/DL + XAI)")
 
 
 # ---------------- Option A: Download pretrained artifacts from GitHub Releases ----------------
-# IMPORTANT: Fill these with your GitHub repo details
-GITHUB_OWNER = "<OWNER>"   # e.g., "abdullah123"
-GITHUB_REPO = "<REPO>"     # e.g., "ckd-xai-streamlit"
+# Repo: https://github.com/Sufyan338/ckd-xai-streamlit  [web:274]
+GITHUB_OWNER = "Sufyan338"
+GITHUB_REPO = "ckd-xai-streamlit"
 
 RELEASE_ASSET_URLS = {
     "binary_pipeline.joblib": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest/download/binary_pipeline.joblib",
@@ -49,16 +49,13 @@ def _download_file(url: str, dst: Path, timeout: int = 180):
 
 @st.cache_resource
 def ensure_pretrained_artifacts():
-    """Download pretrained artifacts once per container and reuse them."""
-    # If user didn't fill owner/repo, skip download
-    if "<" in GITHUB_OWNER or "<" in GITHUB_REPO:
-        return False
-
+    """
+    Download pretrained artifacts once per container and reuse them via Streamlit resource cache. [web:210][web:215]
+    """
     for name, url in RELEASE_ASSET_URLS.items():
         dst = MODELS_DIR / name
         if (not dst.exists()) or (dst.stat().st_size < 1024):
             _download_file(url, dst)
-
     return True
 
 
@@ -94,19 +91,16 @@ def get_pipeline_parts(pipe):
 
     named = getattr(pipe, "named_steps", {}) or {}
 
-    # Common preprocessor step names
     for k in ("pre", "preprocessor", "prep", "transform", "transformer", "ct"):
         if k in named:
             pre = named[k]
             break
 
-    # Common model step names
     for k in ("model", "clf", "classifier", "estimator"):
         if k in named:
             model = named[k]
             break
 
-    # Fallback: last step is model
     if model is None and hasattr(pipe, "steps") and pipe.steps:
         model = pipe.steps[-1][1]
 
@@ -124,8 +118,7 @@ def safe_inverse_transform(le, pred):
 
 @st.cache_resource
 def load_pretrained_models():
-    """Load pretrained artifacts (download first if Option A is configured)."""
-    # Try downloading (if configured)
+    """Load pretrained artifacts (download first)."""
     try:
         ensure_pretrained_artifacts()
     except Exception as e:
@@ -160,13 +153,7 @@ def pipeline_predict_and_explain(
     row_df: pd.DataFrame,
     top_k: int = 12,
 ):
-    """Predict + reason for one sample.
-
-    Strategy:
-    - If tree model and preprocessor available: SHAP in transformed feature space.
-    - Else: model-agnostic local perturbation importance.
-    """
-    # ---- Predict
+    """Predict + reason for one sample."""
     raw_pred = pipe.predict(row_df)[0]
     pred_label = safe_inverse_transform(le, raw_pred)
 
@@ -177,13 +164,11 @@ def pipeline_predict_and_explain(
         except Exception:
             proba = None
 
-    # ---- Explain
     if X_ref is None or len(X_ref) == 0:
         return pred_label, proba, "No XAI (empty reference set)", None, pd.DataFrame()
 
     pre, base_model = get_pipeline_parts(pipe)
 
-    # Determine if tree model
     model_name = base_model.__class__.__name__.lower() if base_model is not None else ""
     is_tree = (
         model_name in {m.lower() for m in TREE_MODELS}
@@ -313,7 +298,6 @@ with tabs[1]:
         horizontal=True,
     )
 
-    # Configure instant training options BEFORE submit (Streamlit state stability)
     instant_target = None
     instant_task_mode = None
     instant_model_name = None
@@ -342,7 +326,6 @@ with tabs[1]:
 
         instant_model_name = st.selectbox("Model", avail, key="instant_model")
 
-    # ---- Build one input row via form (submit once)
     with st.form("live_pred_form"):
         c1, c2, c3 = st.columns(3)
         row = {}
@@ -371,15 +354,17 @@ with tabs[1]:
             if pretrained is None:
                 st.error(
                     "Pretrained artifacts not available.\n"
-                    "1) Upload the 4 joblib files to GitHub Releases\n"
-                    "2) Set GITHUB_OWNER and GITHUB_REPO in app.py\n"
-                    "3) Redeploy"
+                    "1) Upload these 4 files to GitHub Releases assets:\n"
+                    "   - binary_pipeline.joblib\n"
+                    "   - binary_label_encoder.joblib\n"
+                    "   - stage_pipeline.joblib\n"
+                    "   - stage_label_encoder.joblib\n"
+                    "2) Redeploy Streamlit app."
                 )
                 st.stop()
 
             bin_pipe, bin_le, stg_pipe, stg_le = pretrained
 
-            # Binary
             st.markdown("### Binary result (ckd_pred)")
             pred_label, proba, method, fig, df_reason = pipeline_predict_and_explain(
                 pipe=bin_pipe,
@@ -395,7 +380,6 @@ with tabs[1]:
             render_figure(fig)
             st.dataframe(df_reason, use_container_width=True)
 
-            # Stage
             st.markdown("### Stage result (ckd_stage)")
             pred_label, proba, method, fig, df_reason = pipeline_predict_and_explain(
                 pipe=stg_pipe,
@@ -412,7 +396,6 @@ with tabs[1]:
             st.dataframe(df_reason, use_container_width=True)
 
         else:
-            # Train instantly from uploaded dataset
             if instant_target is None or instant_task_mode is None or instant_model_name is None:
                 st.error("Instant-training options are not configured.")
                 st.stop()
@@ -428,7 +411,6 @@ with tabs[1]:
             pre = build_preprocessor(X_all, dense_output=True)
             model = spec.builder()
 
-            pipe = None
             if use_smote:
                 try:
                     from imblearn.pipeline import Pipeline as ImbPipeline
