@@ -1,153 +1,107 @@
 import streamlit as st
 import pandas as pd
 
-from src.config import TARGET_BINARY, TARGET_STAGE
+from src.config import TARGET_BINARY, TARGET_STAGE, N_SPLITS
 from src.data_io import load_csv
-from src.preprocess import build_preprocessor, apply_outlier_rules
-from src.train import train_all_models
+from src.preprocess import apply_outlier_rules, build_preprocessor
+from src.models import get_model_specs
 from src.evaluate import evaluate_models_cv
-from src.xai import explain_tree_model_global
+from src.xai import global_permutation_importance, shap_summary_if_available
+
+from sklearn.pipeline import Pipeline
 
 st.set_page_config(page_title="CKD XAI Framework", layout="wide")
+st.title("CKD Smart Diagnostic Framework (ML/DL + XAI)")
 
-st.title("A Smart Diagnostic Framework for Kidney Disease (XAI)")
-
-# ---------- Sidebar ----------
-st.sidebar.header("Settings")
-
-task = st.sidebar.selectbox(
-    "Task",
-    ["Binary (ckd_pred)", "Multiclass (ckd_stage)"]
-)
-
-use_smote = st.sidebar.checkbox("Use SMOTE (train folds only)", value=True)
-outlier_method = st.sidebar.selectbox("Outlier handling", ["None", "IQR", "Z-Score"])
-do_hpo = st.sidebar.checkbox("Use hyperparameters (preset)", value=True)
-
-st.sidebar.divider()
-selected_models = st.sidebar.multiselect(
-    "Models",
-    ["CatBoost", "LightGBM", "XGBoost", "TabPFN", "TabNet"],
-    default=["CatBoost", "LightGBM", "XGBoost"]
-)
-
-# ---------- Upload ----------
-uploaded = st.file_uploader("Upload your dataset CSV", type=["csv"])
-
-if uploaded is None:
-    st.info("Upload CSV to continue. Required targets: ckd_pred and ckd_stage.")
+uploaded = st.file_uploader("Upload CKD dataset (CSV)", type=["csv"])
+if not uploaded:
     st.stop()
 
 df = load_csv(uploaded)
 
-st.subheader("Dataset preview")
-st.write(df.head())
-
-# choose target column
-target_col = TARGET_BINARY if task.startswith("Binary") else TARGET_STAGE
-
-if target_col not in df.columns:
-    st.error(f"Target column missing: {target_col}")
+if TARGET_BINARY not in df.columns or TARGET_STAGE not in df.columns:
+    st.error(f"Targets must exist: {TARGET_BINARY}, {TARGET_STAGE}")
     st.stop()
 
-# ---------- Tabs ----------
-tab1, tab2, tab3 = st.tabs(["Train & Compare", "Predict", "Explain (XAI)"])
+st.write("Preview")
+st.dataframe(df.head(), use_container_width=True)
 
-with tab1:
+# Sidebar
+st.sidebar.header("Settings")
+task = st.sidebar.selectbox("Task", ["Binary", "Stage (0–5)"])
+target = TARGET_BINARY if task == "Binary" else TARGET_STAGE
+
+outlier_method = st.sidebar.selectbox("Outlier handling", ["None", "IQR", "Z-Score"])
+use_smote = st.sidebar.checkbox("Use SMOTE (inside CV folds)", value=True)
+use_hpo = st.sidebar.checkbox("Use stronger hyperparams (preset)", value=True)
+
+task_mode = "binary" if task == "Binary" else "multiclass"
+n_classes = int(df[TARGET_STAGE].nunique())
+
+model_specs = get_model_specs(task=task_mode, use_hpo=use_hpo, n_classes=n_classes)
+
+available_models = [k for k, v in model_specs.items() if v.available]
+selected_models = st.sidebar.multiselect("Models", list(model_specs.keys()), default=available_models[:3])
+
+tabs = st.tabs(["Train & Compare", "Explain (XAI)"])
+
+with tabs[0]:
     st.subheader("Train & Compare (5-fold CV)")
+    if st.button("Run 5-fold CV", type="primary"):
+        df2 = apply_outlier_rules(df, method=outlier_method, exclude_cols=[TARGET_BINARY, TARGET_STAGE])
+        X = df2.drop(columns=[TARGET_BINARY, TARGET_STAGE])
+        y = df2[target]
 
-    if st.button("Run training + 5-fold CV", type="primary"):
-        df2 = apply_outlier_rules(df, method=outlier_method, target_cols=[TARGET_BINARY, TARGET_STAGE])
+        def pre_fn(Xfit, dense_output=True):
+            return build_preprocessor(Xfit, dense_output=dense_output)
 
-        X = df2.drop(columns=[TARGET_BINARY, TARGET_STAGE], errors="ignore")
-        y = df2[target_col]
-
-        pre = build_preprocessor(X)
-
-        with st.spinner("Training models..."):
-            models = train_all_models(
+        with st.spinner("Running CV..."):
+            summary, fold_store = evaluate_models_cv(
                 X, y,
-                preprocessor=pre,
-                models=selected_models,
-                task=("binary" if target_col == TARGET_BINARY else "multiclass"),
+                build_preprocessor_fn=pre_fn,
+                model_specs=model_specs,
+                selected_models=selected_models,
                 use_smote=use_smote,
-                use_hpo=do_hpo
-            )
-
-        with st.spinner("Cross-validating..."):
-            results = evaluate_models_cv(
-                X, y,
-                preprocessor=pre,
-                fitted_models=models,
-                task=("binary" if target_col == TARGET_BINARY else "multiclass"),
-                use_smote=use_smote,
-                n_splits=5
+                n_splits=N_SPLITS
             )
 
         st.session_state["X"] = X
         st.session_state["y"] = y
-        st.session_state["preprocessor"] = pre
-        st.session_state["models"] = models
-        st.session_state["cv_results"] = results
+        st.session_state["summary"] = summary
+        st.success("Done")
+        st.dataframe(summary, use_container_width=True)
 
-        st.success("Done.")
-
-    if "cv_results" in st.session_state:
-        st.subheader("CV results")
-        st.dataframe(st.session_state["cv_results"], use_container_width=True)
-
-with tab2:
-    st.subheader("Predict")
-
-    if "models" not in st.session_state:
-        st.warning("Train models first (Train & Compare tab).")
-        st.stop()
-
-    models = st.session_state["models"]
-    pre = st.session_state["preprocessor"]
-    X_cols = st.session_state["X"].columns.tolist()
-
-    st.write("Enter one patient record (single-row prediction).")
-    input_data = {}
-    cols = st.columns(3)
-    for i, c in enumerate(X_cols):
-        with cols[i % 3]:
-            input_data[c] = st.text_input(c, value="")
-
-    if st.button("Predict"):
-        row = pd.DataFrame([input_data])
-
-        # NOTE: For a real app you should cast types properly (float/int/category).
-        # This starter keeps it simple; type-casting will be added after you share your dataset schema.
-        row_t = pre.fit_transform(st.session_state["X"]).shape  # warm-up placeholder
-
-        st.info("Starter UI ready. After you share column dtypes, type-casting + real predict will be enabled.")
-
-with tab3:
+with tabs[1]:
     st.subheader("Explain (XAI)")
 
-    if "models" not in st.session_state:
-        st.warning("Train models first.")
+    if "X" not in st.session_state:
+        st.warning("Run training first.")
         st.stop()
 
-    if len(st.session_state["models"]) == 0:
-        st.warning("No trained models found.")
+    X = st.session_state["X"]
+    y = st.session_state["y"]
+
+    model_name = st.selectbox("Model to explain", selected_models)
+    spec = model_specs.get(model_name)
+
+    if spec is None or not spec.available:
+        st.error("Selected model is not available in this deployment.")
         st.stop()
 
-    model_name = st.selectbox("Pick a model to explain", list(st.session_state["models"].keys()))
-    model = st.session_state["models"][model_name]
+    # Train one model on full data just for explanation
+    pre = build_preprocessor(X, dense_output=True)
+    model = spec.builder()
+    pipe = Pipeline([("pre", pre), ("model", model)])
+    pipe.fit(X, y)
 
-    st.write("Global explanation (top features).")
+    st.write("Permutation importance (safe, works for any sklearn-like pipeline):")
+    fig = global_permutation_importance(pipe, X, y, top_k=15)
+    st.pyplot(fig, clear_figure=True)
 
     if model_name in ["CatBoost", "LightGBM", "XGBoost"]:
-        fig = explain_tree_model_global(
-            model=model,
-            X=st.session_state["X"],
-            preprocessor=st.session_state["preprocessor"],
-            max_background=200,
-            max_explain=500
-        )
-        st.pyplot(fig, clear_figure=True)
-    else:
-        st.info("For TabPFN/TabNet, this starter shows XAI later via permutation importance / native feature masks.")
-
+        st.write("Optional SHAP summary (if SHAP works in your environment):")
+        shap_fig, err = shap_summary_if_available(model, X)
+        if shap_fig is not None:
+            st.pyplot(shap_fig, clear_figure=True)
+        else:
+            st.info(f"SHAP not available/failed: {err}")
