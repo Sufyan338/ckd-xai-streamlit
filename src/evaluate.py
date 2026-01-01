@@ -1,4 +1,3 @@
-import numpy as np
 import pandas as pd
 
 from sklearn.model_selection import StratifiedKFold
@@ -6,9 +5,9 @@ from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_sc
 from sklearn.pipeline import Pipeline
 from sklearn.base import clone
 
+
 def _make_pipeline(preprocessor, model, use_smote: bool):
     if use_smote:
-        # SMOTE must be inside CV folds to avoid leakage.
         from imblearn.pipeline import Pipeline as ImbPipeline
         from imblearn.over_sampling import SMOTE
         return ImbPipeline(steps=[
@@ -21,16 +20,17 @@ def _make_pipeline(preprocessor, model, use_smote: bool):
         ("model", model),
     ])
 
+
 def evaluate_models_cv(X, y, build_preprocessor_fn, model_specs, selected_models, use_smote, n_splits=5):
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
     summary_rows = []
-    fold_store = {}  # for t-tests later (optional)
+    fold_store = {}
 
     for name in selected_models:
         spec = model_specs.get(name)
         if spec is None or not spec.available:
-            summary_rows.append({"Model": name, "Status": f"Unavailable: {getattr(spec,'reason', 'not found')}"})
+            summary_rows.append({"Model": name, "Status": f"Unavailable: {getattr(spec,'reason','not found')}"})
             continue
 
         fold_metrics = []
@@ -39,24 +39,17 @@ def evaluate_models_cv(X, y, build_preprocessor_fn, model_specs, selected_models
             Xtr, Xte = X.iloc[tr_idx], X.iloc[te_idx]
             ytr, yte = y.iloc[tr_idx], y.iloc[te_idx]
 
-            pre = build_preprocessor_fn(Xtr, dense_output=True)  # dense helps SMOTE
+            pre = build_preprocessor_fn(Xtr, dense_output=True)
             model = spec.builder()
 
-            # clone when possible to avoid state leakage
             try:
                 model = clone(model)
             except Exception:
                 pass
 
             pipe = _make_pipeline(pre, model, use_smote=use_smote)
-
-            # TabNet needs numpy arrays; handle separately
-            if name == "TabNet":
-                pipe.fit(Xtr, ytr)  # will work only if TabNet supports inside sklearn pipeline in your environment
-                pred = pipe.predict(Xte)
-            else:
-                pipe.fit(Xtr, ytr)
-                pred = pipe.predict(Xte)
+            pipe.fit(Xtr, ytr)
+            pred = pipe.predict(Xte)
 
             fold_metrics.append({
                 "accuracy": accuracy_score(yte, pred),
