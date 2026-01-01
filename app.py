@@ -2,6 +2,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
+from pathlib import Path
+import requests
+
 from sklearn.preprocessing import LabelEncoder
 from sklearn.pipeline import Pipeline
 
@@ -19,6 +22,46 @@ st.set_page_config(page_title="CKD XAI Framework", layout="wide")
 st.title("CKD Smart Diagnostic Framework (ML/DL + XAI)")
 
 
+# ---------------- Option A: Download pretrained artifacts from GitHub Releases ----------------
+# IMPORTANT: Fill these with your GitHub repo details
+GITHUB_OWNER = "<OWNER>"   # e.g., "abdullah123"
+GITHUB_REPO = "<REPO>"     # e.g., "ckd-xai-streamlit"
+
+RELEASE_ASSET_URLS = {
+    "binary_pipeline.joblib": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest/download/binary_pipeline.joblib",
+    "binary_label_encoder.joblib": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest/download/binary_label_encoder.joblib",
+    "stage_pipeline.joblib": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest/download/stage_pipeline.joblib",
+    "stage_label_encoder.joblib": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest/download/stage_label_encoder.joblib",
+}
+
+MODELS_DIR = Path(__file__).resolve().parent / "models"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _download_file(url: str, dst: Path, timeout: int = 180):
+    r = requests.get(url, stream=True, timeout=timeout, allow_redirects=True)
+    r.raise_for_status()
+    with dst.open("wb") as f:
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+
+
+@st.cache_resource
+def ensure_pretrained_artifacts():
+    """Download pretrained artifacts once per container and reuse them."""
+    # If user didn't fill owner/repo, skip download
+    if "<" in GITHUB_OWNER or "<" in GITHUB_REPO:
+        return False
+
+    for name, url in RELEASE_ASSET_URLS.items():
+        dst = MODELS_DIR / name
+        if (not dst.exists()) or (dst.stat().st_size < 1024):
+            _download_file(url, dst)
+
+    return True
+
+
 # ---------------- Helpers ----------------
 def render_figure(fig):
     """Render matplotlib or plotly figures safely in Streamlit."""
@@ -34,7 +77,6 @@ def render_figure(fig):
     # Matplotlib
     try:
         import matplotlib.figure
-
         if isinstance(fig, matplotlib.figure.Figure):
             st.pyplot(fig, clear_figure=True)
             return
@@ -82,21 +124,33 @@ def safe_inverse_transform(le, pred):
 
 @st.cache_resource
 def load_pretrained_models():
-    """Load pretrained artifacts once per Streamlit session."""
+    """Load pretrained artifacts (download first if Option A is configured)."""
+    # Try downloading (if configured)
+    try:
+        ensure_pretrained_artifacts()
+    except Exception as e:
+        st.error(f"Failed to download pretrained artifacts: {e}")
+        return None
+
     required = [
         "binary_pipeline.joblib",
         "binary_label_encoder.joblib",
         "stage_pipeline.joblib",
         "stage_label_encoder.joblib",
     ]
+
     if not all(artifact_exists(x) for x in required):
         return None
 
-    bin_pipe = load_artifact("binary_pipeline.joblib")
-    bin_le = load_artifact("binary_label_encoder.joblib")
-    stg_pipe = load_artifact("stage_pipeline.joblib")
-    stg_le = load_artifact("stage_label_encoder.joblib")
-    return bin_pipe, bin_le, stg_pipe, stg_le
+    try:
+        bin_pipe = load_artifact("binary_pipeline.joblib")
+        bin_le = load_artifact("binary_label_encoder.joblib")
+        stg_pipe = load_artifact("stage_pipeline.joblib")
+        stg_le = load_artifact("stage_label_encoder.joblib")
+        return bin_pipe, bin_le, stg_pipe, stg_le
+    except Exception as e:
+        st.error(str(e))
+        return None
 
 
 def pipeline_predict_and_explain(
@@ -112,7 +166,6 @@ def pipeline_predict_and_explain(
     - If tree model and preprocessor available: SHAP in transformed feature space.
     - Else: model-agnostic local perturbation importance.
     """
-
     # ---- Predict
     raw_pred = pipe.predict(row_df)[0]
     pred_label = safe_inverse_transform(le, raw_pred)
@@ -163,7 +216,6 @@ def pipeline_predict_and_explain(
             )
             return pred_label, proba, "SHAP (tree)", fig, df_reason
         except Exception:
-            # fall back to perturbation
             pass
 
     fig, df_reason = local_perturbation_reason(pipe, X_ref, row_df, top_k=top_k)
@@ -317,7 +369,12 @@ with tabs[1]:
         if mode.startswith("Use pretrained"):
             pretrained = load_pretrained_models()
             if pretrained is None:
-                st.error("Pretrained artifacts not found. Add them via your repo artifact storage.")
+                st.error(
+                    "Pretrained artifacts not available.\n"
+                    "1) Upload the 4 joblib files to GitHub Releases\n"
+                    "2) Set GITHUB_OWNER and GITHUB_REPO in app.py\n"
+                    "3) Redeploy"
+                )
                 st.stop()
 
             bin_pipe, bin_le, stg_pipe, stg_le = pretrained
@@ -368,7 +425,6 @@ with tabs[1]:
             specs = get_model_specs(task=instant_task_mode, use_hpo=True, n_classes=n_classes)
             spec = specs[instant_model_name]
 
-            # Pipelines
             pre = build_preprocessor(X_all, dense_output=True)
             model = spec.builder()
 
