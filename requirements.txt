@@ -2,11 +2,14 @@ streamlit
 pandas
 numpy
 scikit-learn
-shap
+imbalanced-learn
+matplotlib
+
+# optional (install only if you really need them)
 xgboost
 lightgbm
 catboost
-imbalanced-learn
+shap
 pytorch-tabnet
 tabpfn
 
