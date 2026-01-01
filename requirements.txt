@@ -2,14 +2,15 @@ streamlit
 pandas
 numpy
 scikit-learn
-imbalanced-learn
+joblib
 matplotlib
+imbalanced-learn
 
-# optional (install only if you really need them)
 xgboost
 lightgbm
 catboost
 shap
+
+# optional (keep only if your Streamlit Cloud build supports them)
 pytorch-tabnet
 tabpfn
-
