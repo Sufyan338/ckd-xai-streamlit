@@ -1,9 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-
-from pathlib import Path
-import requests
+import hashlib
 
 from sklearn.preprocessing import LabelEncoder
 from sklearn.pipeline import Pipeline
@@ -13,50 +11,12 @@ from src.data_io import load_csv
 from src.preprocess import apply_outlier_rules, build_preprocessor, infer_columns, get_feature_names
 from src.models import get_model_specs
 from src.evaluate import evaluate_models_cv
-from src.persistence import load_artifact, artifact_exists
 from src.xai import TREE_MODELS, local_shap_reason, local_perturbation_reason
 
 
 # ---------------- Page ----------------
 st.set_page_config(page_title="CKD XAI Framework", layout="wide")
 st.title("CKD Smart Diagnostic Framework (ML/DL + XAI)")
-
-
-# ---------------- Option A: Download pretrained artifacts from GitHub Releases ----------------
-# Repo: https://github.com/Sufyan338/ckd-xai-streamlit  [web:274]
-GITHUB_OWNER = "Sufyan338"
-GITHUB_REPO = "ckd-xai-streamlit"
-
-RELEASE_ASSET_URLS = {
-    "binary_pipeline.joblib": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest/download/binary_pipeline.joblib",
-    "binary_label_encoder.joblib": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest/download/binary_label_encoder.joblib",
-    "stage_pipeline.joblib": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest/download/stage_pipeline.joblib",
-    "stage_label_encoder.joblib": f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest/download/stage_label_encoder.joblib",
-}
-
-MODELS_DIR = Path(__file__).resolve().parent / "models"
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _download_file(url: str, dst: Path, timeout: int = 180):
-    r = requests.get(url, stream=True, timeout=timeout, allow_redirects=True)
-    r.raise_for_status()
-    with dst.open("wb") as f:
-        for chunk in r.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                f.write(chunk)
-
-
-@st.cache_resource
-def ensure_pretrained_artifacts():
-    """
-    Download pretrained artifacts once per container and reuse them via Streamlit resource cache. [web:210][web:215]
-    """
-    for name, url in RELEASE_ASSET_URLS.items():
-        dst = MODELS_DIR / name
-        if (not dst.exists()) or (dst.stat().st_size < 1024):
-            _download_file(url, dst)
-    return True
 
 
 # ---------------- Helpers ----------------
@@ -74,13 +34,13 @@ def render_figure(fig):
     # Matplotlib
     try:
         import matplotlib.figure
+
         if isinstance(fig, matplotlib.figure.Figure):
             st.pyplot(fig, clear_figure=True)
             return
     except Exception:
         pass
 
-    # Fallback
     st.write(fig)
 
 
@@ -116,36 +76,6 @@ def safe_inverse_transform(le, pred):
         return str(pred)
 
 
-@st.cache_resource
-def load_pretrained_models():
-    """Load pretrained artifacts (download first)."""
-    try:
-        ensure_pretrained_artifacts()
-    except Exception as e:
-        st.error(f"Failed to download pretrained artifacts: {e}")
-        return None
-
-    required = [
-        "binary_pipeline.joblib",
-        "binary_label_encoder.joblib",
-        "stage_pipeline.joblib",
-        "stage_label_encoder.joblib",
-    ]
-
-    if not all(artifact_exists(x) for x in required):
-        return None
-
-    try:
-        bin_pipe = load_artifact("binary_pipeline.joblib")
-        bin_le = load_artifact("binary_label_encoder.joblib")
-        stg_pipe = load_artifact("stage_pipeline.joblib")
-        stg_le = load_artifact("stage_label_encoder.joblib")
-        return bin_pipe, bin_le, stg_pipe, stg_le
-    except Exception as e:
-        st.error(str(e))
-        return None
-
-
 def pipeline_predict_and_explain(
     pipe: Pipeline,
     le: LabelEncoder,
@@ -153,7 +83,14 @@ def pipeline_predict_and_explain(
     row_df: pd.DataFrame,
     top_k: int = 12,
 ):
-    """Predict + reason for one sample."""
+    """Predict + reason for one sample.
+
+    Strategy:
+    - If tree model and preprocessor available: SHAP in transformed feature space.
+    - Else: model-agnostic local perturbation importance.
+
+    SHAP is optional: if it errors (e.g., shap not installed), code falls back to perturbation.
+    """
     raw_pred = pipe.predict(row_df)[0]
     pred_label = safe_inverse_transform(le, raw_pred)
 
@@ -207,6 +144,45 @@ def pipeline_predict_and_explain(
     return pred_label, proba, "Local perturbation (model-agnostic)", fig, df_reason
 
 
+def _dataset_signature(uploaded_file) -> str:
+    """Stable signature for caching training per uploaded CSV."""
+    try:
+        b = uploaded_file.getvalue()
+        return hashlib.sha256(b).hexdigest()
+    except Exception:
+        return "no_signature"
+
+
+@st.cache_resource
+def train_full_model(signature: str, task_mode: str, target_name: str, model_name: str, use_smote: bool, X: pd.DataFrame, y: pd.Series):
+    """Train model on full dataset and cache it per dataset+settings."""
+    n_classes = int(y.nunique())
+    specs = get_model_specs(task=task_mode, use_hpo=True, n_classes=n_classes)
+    if model_name not in specs:
+        raise ValueError(f"Model not found: {model_name}")
+
+    pre = build_preprocessor(X, dense_output=True)
+    model = specs[model_name].builder()
+
+    if use_smote:
+        try:
+            from imblearn.pipeline import Pipeline as ImbPipeline
+            from imblearn.over_sampling import SMOTE
+
+            pipe = ImbPipeline([
+                ("pre", pre),
+                ("smote", SMOTE(random_state=42)),
+                ("model", model),
+            ])
+        except Exception:
+            pipe = Pipeline([("pre", pre), ("model", model)])
+    else:
+        pipe = Pipeline([("pre", pre), ("model", model)])
+
+    pipe.fit(X, y)
+    return pipe
+
+
 # ---------------- Upload dataset ----------------
 uploaded = st.file_uploader("Upload CKD dataset (CSV)", type=["csv"])
 if not uploaded:
@@ -228,6 +204,10 @@ st.sidebar.header("Settings")
 outlier_method = st.sidebar.selectbox("Outlier handling", ["None", "IQR", "Z-Score"])
 use_smote = st.sidebar.checkbox("Use SMOTE (CV + full-train)", value=True)
 
+if st.sidebar.button("Clear cache"):
+    st.cache_resource.clear()
+    st.rerun()
+
 
 # ---------------- Prepare features ----------------
 df2 = apply_outlier_rules(df, method=outlier_method, exclude_cols=[TARGET_BINARY, TARGET_STAGE])
@@ -238,9 +218,9 @@ if X_all.shape[1] == 0:
     st.stop()
 
 num_cols, cat_cols = infer_columns(X_all)
+sig = _dataset_signature(uploaded)
 
-
-tabs = st.tabs(["Train & Compare", "Live Prediction (Reason)", "Explain (XAI)"])
+tabs = st.tabs(["Train & Compare", "Live Prediction (Train instantly)", "Explain (XAI)"])
 
 
 # ---------------- Tab 1: Train & Compare ----------------
@@ -288,43 +268,31 @@ with tabs[0]:
         st.dataframe(summary, use_container_width=True)
 
 
-# ---------------- Tab 2: Live Prediction ----------------
+# ---------------- Tab 2: Live Prediction (Train instantly) ----------------
 with tabs[1]:
-    st.subheader("Live Prediction (with Reasons)")
+    st.subheader("Live Prediction (Train instantly)")
 
-    mode = st.radio(
-        "Prediction mode",
-        ["Use pretrained models (recommended)", "Train instantly from uploaded dataset"],
-        horizontal=True,
+    task_pick = st.selectbox(
+        "Choose task",
+        ["Binary (ckd_pred)", "Multiclass (ckd_stage)"],
+        key="instant_task",
     )
 
-    instant_target = None
-    instant_task_mode = None
-    instant_model_name = None
+    instant_target = TARGET_BINARY if task_pick.startswith("Binary") else TARGET_STAGE
+    instant_task_mode = "binary" if instant_target == TARGET_BINARY else "multiclass"
 
-    if mode.startswith("Train instantly"):
-        st.markdown("#### Instant-training options")
-        task_pick = st.selectbox(
-            "Choose task to train for prediction",
-            ["Binary (ckd_pred)", "Multiclass (ckd_stage)"],
-            key="instant_task",
-        )
-        instant_target = TARGET_BINARY if task_pick.startswith("Binary") else TARGET_STAGE
-        instant_task_mode = "binary" if instant_target == TARGET_BINARY else "multiclass"
+    y_raw_i = df2[instant_target]
+    le_i = LabelEncoder()
+    y_i = pd.Series(le_i.fit_transform(y_raw_i.astype(str)), index=y_raw_i.index)
 
-        y_raw_i = df2[instant_target]
-        le_i = LabelEncoder()
-        y_i = pd.Series(le_i.fit_transform(y_raw_i.astype(str)), index=y_raw_i.index)
-        n_classes_i = int(y_i.nunique())
+    specs = get_model_specs(task=instant_task_mode, use_hpo=True, n_classes=int(y_i.nunique()))
+    avail = [k for k, v in specs.items() if getattr(v, "available", False)]
 
-        specs = get_model_specs(task=instant_task_mode, use_hpo=True, n_classes=n_classes_i)
-        avail = [k for k, v in specs.items() if getattr(v, "available", False)]
+    if not avail:
+        st.error("No available models for this task.")
+        st.stop()
 
-        if not avail:
-            st.error("No available models for instant training.")
-            st.stop()
-
-        instant_model_name = st.selectbox("Model", avail, key="instant_model")
+    instant_model_name = st.selectbox("Model", avail, key="instant_model")
 
     with st.form("live_pred_form"):
         c1, c2, c3 = st.columns(3)
@@ -342,114 +310,42 @@ with tabs[1]:
                     options = [""]
                 row[col] = st.selectbox(col, options=options, index=0)
 
-        submit = st.form_submit_button("Predict & Explain")
+        submit = st.form_submit_button("Train (cached) + Predict & Explain")
 
     if submit:
         row_df = pd.DataFrame([row])
         for col in cat_cols:
             row_df[col] = row_df[col].astype(str)
 
-        if mode.startswith("Use pretrained"):
-            pretrained = load_pretrained_models()
-            if pretrained is None:
-                st.error(
-                    "Pretrained artifacts not available.\n"
-                    "1) Upload these 4 files to GitHub Releases assets:\n"
-                    "   - binary_pipeline.joblib\n"
-                    "   - binary_label_encoder.joblib\n"
-                    "   - stage_pipeline.joblib\n"
-                    "   - stage_label_encoder.joblib\n"
-                    "2) Redeploy Streamlit app."
-                )
-                st.stop()
-
-            bin_pipe, bin_le, stg_pipe, stg_le = pretrained
-
-            st.markdown("### Binary result (ckd_pred)")
-            pred_label, proba, method, fig, df_reason = pipeline_predict_and_explain(
-                pipe=bin_pipe,
-                le=bin_le,
-                X_ref=X_all,
-                row_df=row_df,
-                top_k=12,
-            )
-            st.success(f"Prediction: {pred_label}")
-            if proba is not None:
-                st.write("Probabilities:", proba)
-            st.write("Reason method:", method)
-            render_figure(fig)
-            st.dataframe(df_reason, use_container_width=True)
-
-            st.markdown("### Stage result (ckd_stage)")
-            pred_label, proba, method, fig, df_reason = pipeline_predict_and_explain(
-                pipe=stg_pipe,
-                le=stg_le,
-                X_ref=X_all,
-                row_df=row_df,
-                top_k=12,
-            )
-            st.success(f"Prediction: {pred_label}")
-            if proba is not None:
-                st.write("Probabilities:", proba)
-            st.write("Reason method:", method)
-            render_figure(fig)
-            st.dataframe(df_reason, use_container_width=True)
-
-        else:
-            if instant_target is None or instant_task_mode is None or instant_model_name is None:
-                st.error("Instant-training options are not configured.")
-                st.stop()
-
-            y_raw = df2[instant_target]
-            le = LabelEncoder()
-            y = pd.Series(le.fit_transform(y_raw.astype(str)), index=y_raw.index)
-
-            n_classes = int(y.nunique())
-            specs = get_model_specs(task=instant_task_mode, use_hpo=True, n_classes=n_classes)
-            spec = specs[instant_model_name]
-
-            pre = build_preprocessor(X_all, dense_output=True)
-            model = spec.builder()
-
-            if use_smote:
-                try:
-                    from imblearn.pipeline import Pipeline as ImbPipeline
-                    from imblearn.over_sampling import SMOTE
-
-                    pipe = ImbPipeline(
-                        [
-                            ("pre", pre),
-                            ("smote", SMOTE(random_state=42)),
-                            ("model", model),
-                        ]
-                    )
-                except Exception:
-                    st.warning("imblearn not available; training without SMOTE.")
-                    pipe = Pipeline([("pre", pre), ("model", model)])
-            else:
-                pipe = Pipeline([("pre", pre), ("model", model)])
-
-            with st.spinner("Training model on full dataset..."):
-                pipe.fit(X_all, y)
-
-            pred_label, proba, method, fig, df_reason = pipeline_predict_and_explain(
-                pipe=pipe,
-                le=le,
-                X_ref=X_all,
-                row_df=row_df,
-                top_k=12,
+        with st.spinner("Training model on full dataset (cached)..."):
+            pipe = train_full_model(
+                signature=sig,
+                task_mode=instant_task_mode,
+                target_name=instant_target,
+                model_name=instant_model_name,
+                use_smote=use_smote,
+                X=X_all,
+                y=y_i,
             )
 
-            st.success(f"{instant_target} Prediction: {pred_label}")
-            if proba is not None:
-                st.write("Probabilities:", proba)
-            st.write("Reason method:", method)
-            render_figure(fig)
-            st.dataframe(df_reason, use_container_width=True)
+        pred_label, proba, method, fig, df_reason = pipeline_predict_and_explain(
+            pipe=pipe,
+            le=le_i,
+            X_ref=X_all,
+            row_df=row_df,
+            top_k=12,
+        )
+
+        st.success(f"{instant_target} Prediction: {pred_label}")
+        if proba is not None:
+            st.write("Probabilities:", proba)
+        st.write("Reason method:", method)
+        render_figure(fig)
+        st.dataframe(df_reason, use_container_width=True)
 
 
 # ---------------- Tab 3: Explain (XAI) ----------------
 with tabs[2]:
     st.subheader("Explain (XAI)")
-    st.write("The main per-patient explanation is shown in the Live Prediction tab.")
-    st.write("Use Live Prediction to see per-sample feature impacts.")
+    st.write("Per-patient explanation is shown in Live Prediction tab.")
+    st.write("Use Train (cached) + Predict & Explain to see feature impacts.")
